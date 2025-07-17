@@ -1,28 +1,36 @@
 import { v4 as uuidv4 } from 'uuid';
-import { promises as fs } from 'fs';
+import { promises as fsPromises, createReadStream } from 'fs';
 import path from 'path';
 import { ObjectId } from 'mongodb';
+import mime from 'mime-types';
 import dbClient from '../utils/db';
 import redisClient from '../utils/redis';
+
+// Helper function to format file documents for response
+const formatFileResponse = (file) => {
+  if (!file) return null;
+  return {
+    id: file._id,
+    userId: file.userId,
+    name: file.name,
+    type: file.type,
+    isPublic: file.isPublic,
+    parentId: file.parentId && file.parentId.toString() !== '0' ? file.parentId : 0,
+  };
+};
 
 /**
  * Controller for file-related operations.
  */
 class FilesController {
+  // ... (postUpload, getShow, getIndex, putPublish, putUnpublish methods are unchanged)
   static async postUpload(req, res) {
-    // ... (existing postUpload method is unchanged)
     const token = req.headers['x-token'];
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
     const userId = await redisClient.get(`auth_${token}`);
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
     const user = await dbClient.db.collection('users').findOne({ _id: new ObjectId(userId) });
-    if (!user) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
 
     const {
       name, type, parentId = '0', isPublic = false, data,
@@ -48,25 +56,17 @@ class FilesController {
         parentId: parentId === '0' ? 0 : new ObjectId(parentId),
       };
       const result = await dbClient.db.collection('files').insertOne(newFolder);
-      const responseFolder = {
-        id: result.insertedId,
-        userId: newFolder.userId,
-        name: newFolder.name,
-        type: newFolder.type,
-        isPublic: newFolder.isPublic,
-        parentId: newFolder.parentId.toString() === '0' ? 0 : newFolder.parentId,
-      };
-      return res.status(201).json(responseFolder);
+      return res.status(201).json(formatFileResponse({ ...newFolder, _id: result.insertedId }));
     }
 
     const folderPath = process.env.FOLDER_PATH || '/tmp/files_manager';
-    await fs.mkdir(folderPath, { recursive: true });
+    await fsPromises.mkdir(folderPath, { recursive: true });
 
     const localPath = path.join(folderPath, uuidv4());
     const fileData = Buffer.from(data, 'base64');
 
     try {
-      await fs.writeFile(localPath, fileData);
+      await fsPromises.writeFile(localPath, fileData);
     } catch (err) {
       console.error(err);
       return res.status(500).json({ error: 'Server error' });
@@ -82,24 +82,9 @@ class FilesController {
     };
 
     const result = await dbClient.db.collection('files').insertOne(newFile);
-
-    const responseFile = {
-      id: result.insertedId,
-      userId: newFile.userId,
-      name: newFile.name,
-      type: newFile.type,
-      isPublic: newFile.isPublic,
-      parentId: newFile.parentId.toString() === '0' ? 0 : newFile.parentId,
-    };
-
-    return res.status(201).json(responseFile);
+    return res.status(201).json(formatFileResponse({ ...newFile, _id: result.insertedId }));
   }
 
-  /**
-   * Retrieves a file document based on its ID.
-   * @param {object} req The Express request object.
-   * @param {object} res The Express response object.
-   */
   static async getShow(req, res) {
     const token = req.headers['x-token'];
     if (!token) return res.status(401).json({ error: 'Unauthorized' });
@@ -117,23 +102,9 @@ class FilesController {
 
     if (!file) return res.status(404).json({ error: 'Not found' });
 
-    const responseFile = {
-      id: file._id,
-      userId: file.userId,
-      name: file.name,
-      type: file.type,
-      isPublic: file.isPublic,
-      parentId: file.parentId.toString() === '0' ? 0 : file.parentId,
-    };
-
-    return res.status(200).json(responseFile);
+    return res.status(200).json(formatFileResponse(file));
   }
 
-  /**
-   * Retrieves all file documents for a user with pagination.
-   * @param {object} req The Express request object.
-   * @param {object} res The Express response object.
-   */
   static async getIndex(req, res) {
     const token = req.headers['x-token'];
     if (!token) return res.status(401).json({ error: 'Unauthorized' });
@@ -157,17 +128,78 @@ class FilesController {
     ];
 
     const files = await dbClient.db.collection('files').aggregate(pipeline).toArray();
-
-    const formattedFiles = files.map((file) => ({
-      id: file._id,
-      userId: file.userId,
-      name: file.name,
-      type: file.type,
-      isPublic: file.isPublic,
-      parentId: file.parentId.toString() === '0' ? 0 : file.parentId,
-    }));
-
+    const formattedFiles = files.map(formatFileResponse);
     return res.status(200).json(formattedFiles);
+  }
+
+  static async updatePublicStatus(req, res, isPublic) {
+    const token = req.headers['x-token'];
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+    const userId = await redisClient.get(`auth_${token}`);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const fileId = req.params.id;
+    if (!ObjectId.isValid(fileId)) return res.status(404).json({ error: 'Not found' });
+
+    const filesCollection = dbClient.db.collection('files');
+    const result = await filesCollection.findOneAndUpdate(
+      { _id: new ObjectId(fileId), userId: new ObjectId(userId) },
+      { $set: { isPublic } },
+      { returnDocument: 'after' },
+    );
+
+    if (!result.value) return res.status(404).json({ error: 'Not found' });
+
+    return res.status(200).json(formatFileResponse(result.value));
+  }
+
+  static async putPublish(req, res) {
+    return FilesController.updatePublicStatus(req, res, true);
+  }
+
+  static async putUnpublish(req, res) {
+    return FilesController.updatePublicStatus(req, res, false);
+  }
+
+  /**
+   * Serves the content of a file.
+   * @param {object} req The Express request object.
+   * @param {object} res The Express response object.
+   */
+  static async getFile(req, res) {
+    const fileId = req.params.id;
+    if (!ObjectId.isValid(fileId)) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    const file = await dbClient.db.collection('files').findOne({ _id: new ObjectId(fileId) });
+    if (!file) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    const token = req.headers['x-token'];
+    const userId = token ? await redisClient.get(`auth_${token}`) : null;
+
+    const isOwner = userId && file.userId.toString() === userId;
+
+    if (!file.isPublic && !isOwner) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    if (file.type === 'folder') {
+      return res.status(400).json({ error: "A folder doesn't have content" });
+    }
+
+    try {
+      await fsPromises.access(file.localPath);
+      const mimeType = mime.lookup(file.name) || 'application/octet-stream';
+      res.setHeader('Content-Type', mimeType);
+      createReadStream(file.localPath).pipe(res);
+      return null;
+    } catch (error) {
+      return res.status(404).json({ error: 'Not found' });
+    }
   }
 }
 
